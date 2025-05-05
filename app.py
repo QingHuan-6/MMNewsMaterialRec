@@ -19,6 +19,8 @@ import uuid
 from datetime import datetime
 import logging
 
+#new
+
 
 #导入模型
 import clip
