@@ -1,0 +1,15 @@
+clip_cn_vit-b-16.pt
+CNA_cache/
+CNA_images/
+cache_data/
+cache/
+clip/
+cn_clip/
+__pycache__/
+*.zip
+*.npy
+*.pkl
+*.pickle
+*.csv
+*.xlsx
+*.json
