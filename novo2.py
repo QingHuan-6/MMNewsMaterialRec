@@ -13,6 +13,7 @@ import hashlib
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
 from LLM import LLMClient
+import json
 
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'  # 避免内存碎片化
@@ -25,8 +26,86 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 CACHE_DIR = "cache_data"  # 统一缓存目录
 HISTORY_EMB_CACHE = os.path.join(CACHE_DIR, "history_embeddings.pkl")  # 历史文章向量缓存
 KEYWORD_CACHE = os.path.join(CACHE_DIR, "keywords_cache.pkl")  # 关键词缓存
-BATCH_SIZE = 1  # 批量处理大小
-NUM_WORKERS = 1  # 并行工作线程数
+BATCH_SIZE = 32  # 批量处理大小
+NUM_WORKERS = 4  # 并行工作线程数
+WEIGHTS_CONFIG_PATH = "article_weights_config.json"  # 文章推荐权重配置文件
+
+# 默认权重配置
+DEFAULT_ARTICLE_WEIGHTS = {
+    "content_similarity": 0.4,  # 内容相似度权重
+    "theme_match": 0.3,         # 主题匹配权重
+    "sentiment_match": 0.3      # 情感匹配权重
+}
+
+# 全局权重变量
+ARTICLE_WEIGHTS = DEFAULT_ARTICLE_WEIGHTS.copy()
+
+# 加载权重配置
+def load_article_weights():
+    """加载文章推荐权重配置"""
+    global ARTICLE_WEIGHTS
+    try:
+        if os.path.exists(WEIGHTS_CONFIG_PATH):
+            with open(WEIGHTS_CONFIG_PATH, 'r', encoding='utf-8') as f:
+                weights = json.load(f)
+                # 验证权重配置是否完整
+                if all(k in weights for k in DEFAULT_ARTICLE_WEIGHTS.keys()):
+                    # 确保权重和为1
+                    total = sum(weights.values())
+                    if abs(total - 1.0) > 0.01:  # 允许0.01的误差
+                        weights = {k: v / total for k, v in weights.items()}
+                    ARTICLE_WEIGHTS = weights
+                    print(f"已加载文章推荐自定义权重配置: {ARTICLE_WEIGHTS}")
+                    return ARTICLE_WEIGHTS
+    except Exception as e:
+        print(f"加载文章推荐权重配置出错: {e}")
+    
+    print(f"使用默认文章推荐权重配置: {ARTICLE_WEIGHTS}")
+    return ARTICLE_WEIGHTS
+
+# 保存权重配置
+def save_article_weights(weights):
+    """保存文章推荐权重配置"""
+    try:
+        # 验证权重配置
+        if not all(k in weights for k in DEFAULT_ARTICLE_WEIGHTS.keys()):
+            print("权重配置不完整，保存失败")
+            return False
+        
+        # 确保权重和为1
+        total = sum(weights.values())
+        if abs(total - 1.0) > 0.01:  # 允许0.01的误差
+            weights = {k: v / total for k, v in weights.items()}
+        
+        with open(WEIGHTS_CONFIG_PATH, 'w', encoding='utf-8') as f:
+            json.dump(weights, f, ensure_ascii=False, indent=2)
+        
+        # 更新全局变量
+        global ARTICLE_WEIGHTS
+        ARTICLE_WEIGHTS = weights
+        
+        print(f"文章推荐权重配置已保存: {WEIGHTS_CONFIG_PATH}")
+        return True
+    except Exception as e:
+        print(f"保存文章推荐权重配置出错: {e}")
+        return False
+
+# 获取当前权重
+def get_article_weights():
+    """获取当前文章推荐权重配置"""
+    return ARTICLE_WEIGHTS
+
+# 设置权重
+def set_article_weights(new_weights, is_admin=False):
+    """更新文章推荐权重配置（仅管理员可用）"""
+    if not is_admin:
+        print("只有管理员可以更新权重配置")
+        return False
+    
+    return save_article_weights(new_weights)
+
+# 初始化加载权重
+load_article_weights()
 
 # ================== 初始化模型 ==================
 # 中文BERT模型（关键词提取）
@@ -180,6 +259,73 @@ def batch_text_embedding(texts):
     return embeddings
 
 
+# ================== 使用LLM进行新闻分析 ==================
+def analyze_news(news):
+    """使用LLM分析新闻的情感和主题"""
+    # 分析情感
+    sentiment_prompt = f"""你是一个专业的新闻情感分析师。请根据新闻内容，分析新闻文章的情感（负面/中性/正面）。
+    只输出情感类型，若新闻未提及任何主题相关内容。情感包括：{', '.join(SENTIMENTS)}。
+    情感的判断如下：
+    1. 正面：新闻内容若主要包含积极、肯定、赞扬的表达，则可判定为正面情感。例如："某公司成功研发出新型产品，市场反响良好。"
+    2. 中性：新闻内容若只是客观陈述事实，不带有明显的情感偏向，即为中性情感。例如："今天的气温是25摄氏度。"
+    3. 负面：若新闻内容包含消极、否定、批判的表达，则为负面情感。例如："某企业因违规操作被处罚。"
+    请确保输出格式正确，无需其他解释。
+    
+    新闻内容为："{news}"
+    请你分析新闻的情感。
+    """
+    
+    # 调用LLM获取情感分析结果
+    sentiment_result = llm_client.ask(sentiment_prompt)
+    sentiment = sentiment_result["answer"].strip()
+    
+    # 后处理情感结果，确保得到有效输出
+    if sentiment not in SENTIMENTS:
+        # 增加更严格的后处理，若不匹配则尝试根据关键词判断
+        for keyword in ["积极", "肯定", "赞扬"]:
+            if keyword in news:
+                sentiment = "正面"
+                break
+        else:
+            for keyword in ["消极", "否定", "批判"]:
+                if keyword in news:
+                    sentiment = "负面"
+                    break
+            else:
+                sentiment = "中性"
+    
+    # 分析主题
+    topic_prompt = f"""你是一个专业的新闻分类专家。请根据新闻内容，从以下 11 个主题中选择一个合适的主题进行分类，一条新闻只能匹配一个主题。
+    只输出主题名称，不要有其他多余表述。主题包括：{', '.join(TOPICS)}。
+    主题的定义如下：
+    1. 体育：报道竞技体育活动、体育产业发展及运动员相关动态的新闻。例如："某足球比赛精彩落幕，XX队获得冠军。"
+    2. 娱乐：涉及影视演艺行业及公众人物非职业动态的报道。例如："某明星举办婚礼，众多好友出席。"
+    3. 科技：关于技术创新及数字化领域发展的报道。例如："人工智能技术取得重大突破。"
+    4. 时政：我国政府机构运作及国内政治生态相关报道。例如："政府出台新的税收政策。"
+    5. 财经：宏观经济运行及商业金融领域动态。例如："股市今日大幅上涨。"
+    6. 社会：民生问题及公共领域事件报道。例如："某社区开展志愿者活动。"
+    7. 国际：非军事类跨国事务及外交动态。例如："两国签署贸易协议。"
+    8. 军事：国防建设及武装力量相关动态。例如："某军区举行军事演习。"
+    9. 教育：教育体系改革及学术发展动态。例如："某高校改革招生政策。"
+    10. 生活：居民日常消费及基础民生服务。例如："某超市推出优惠活动。"
+    11. 时尚：潮流趋势与美学设计领域动态。例如："某品牌发布新款时装。"
+    请确保输出格式正确，无需其他解释。
+    
+    新闻内容为："{news}"
+    请你进行主题分类。
+    """
+    
+    # 调用LLM获取主题分析结果
+    topic_result = llm_client.ask(topic_prompt)
+    topic = topic_result["answer"].strip()
+    
+    # 后处理主题结果，确保得到有效输出
+    if topic not in TOPICS:
+        topic = "社会"  # 默认主题
+    
+    return sentiment, topic
+
+
 # ================== 历史文章预加载 ==================
 def load_history_data(history_file):
     """加载并预处理历史数据"""
@@ -258,73 +404,6 @@ def load_history_data(history_file):
     return df
 
 
-# ================== 使用LLM进行新闻分析 ==================
-def analyze_news(news):
-    """使用LLM分析新闻的情感和主题"""
-    # 分析情感
-    sentiment_prompt = f"""你是一个专业的新闻情感分析师。请根据新闻内容，分析新闻文章的情感（负面/中性/正面）。
-    只输出情感类型，若新闻未提及任何主题相关内容。情感包括：{', '.join(SENTIMENTS)}。
-    情感的判断如下：
-    1. 正面：新闻内容若主要包含积极、肯定、赞扬的表达，则可判定为正面情感。例如："某公司成功研发出新型产品，市场反响良好。"
-    2. 中性：新闻内容若只是客观陈述事实，不带有明显的情感偏向，即为中性情感。例如："今天的气温是25摄氏度。"
-    3. 负面：若新闻内容包含消极、否定、批判的表达，则为负面情感。例如："某企业因违规操作被处罚。"
-    请确保输出格式正确，无需其他解释。
-    
-    新闻内容为："{news}"
-    请你分析新闻的情感。
-    """
-    
-    # 调用LLM获取情感分析结果
-    sentiment_result = llm_client.ask(sentiment_prompt)
-    sentiment = sentiment_result["answer"].strip()
-    
-    # 后处理情感结果，确保得到有效输出
-    if sentiment not in SENTIMENTS:
-        # 增加更严格的后处理，若不匹配则尝试根据关键词判断
-        for keyword in ["积极", "肯定", "赞扬"]:
-            if keyword in news:
-                sentiment = "正面"
-                break
-        else:
-            for keyword in ["消极", "否定", "批判"]:
-                if keyword in news:
-                    sentiment = "负面"
-                    break
-            else:
-                sentiment = "中性"
-    
-    # 分析主题
-    topic_prompt = f"""你是一个专业的新闻分类专家。请根据新闻内容，从以下 11 个主题中选择一个合适的主题进行分类，一条新闻只能匹配一个主题。
-    只输出主题名称，不要有其他多余表述。主题包括：{', '.join(TOPICS)}。
-    主题的定义如下：
-    1. 体育：报道竞技体育活动、体育产业发展及运动员相关动态的新闻。例如："某足球比赛精彩落幕，XX队获得冠军。"
-    2. 娱乐：涉及影视演艺行业及公众人物非职业动态的报道。例如："某明星举办婚礼，众多好友出席。"
-    3. 科技：关于技术创新及数字化领域发展的报道。例如："人工智能技术取得重大突破。"
-    4. 时政：我国政府机构运作及国内政治生态相关报道。例如："政府出台新的税收政策。"
-    5. 财经：宏观经济运行及商业金融领域动态。例如："股市今日大幅上涨。"
-    6. 社会：民生问题及公共领域事件报道。例如："某社区开展志愿者活动。"
-    7. 国际：非军事类跨国事务及外交动态。例如："两国签署贸易协议。"
-    8. 军事：国防建设及武装力量相关动态。例如："某军区举行军事演习。"
-    9. 教育：教育体系改革及学术发展动态。例如："某高校改革招生政策。"
-    10. 生活：居民日常消费及基础民生服务。例如："某超市推出优惠活动。"
-    11. 时尚：潮流趋势与美学设计领域动态。例如："某品牌发布新款时装。"
-    请确保输出格式正确，无需其他解释。
-    
-    新闻内容为："{news}"
-    请你进行主题分类。
-    """
-    
-    # 调用LLM获取主题分析结果
-    topic_result = llm_client.ask(topic_prompt)
-    topic = topic_result["answer"].strip()
-    
-    # 后处理主题结果，确保得到有效输出
-    if topic not in TOPICS:
-        topic = "社会"  # 默认主题
-    
-    return sentiment, topic
-
-
 # ================== 从数据库中加载新闻数据的函数 ==================
 def load_news_from_db(db_session, News, top_n=None):
     """从数据库加载新闻数据
@@ -359,7 +438,8 @@ def load_news_from_db(db_session, News, top_n=None):
         '新闻内容': [news.content for news in news_records],
         '主题': [news.topic for news in news_records],
         '分类结果': [news.sentiment for news in news_records],
-        'embedding': [pickle.loads(news.embedding) for news in news_records]
+        'embedding': [pickle.loads(news.embedding) for news in news_records],
+        'upload_time': [news.upload_time for news in news_records]
     })
     
     return df
@@ -452,8 +532,18 @@ def recommend_articles(input_title, input_content, db_session=None, News=None, h
     # 情感匹配得分
     sentiment_scores = [1 if history_df.iloc[i]['分类结果'] == sentiment_result else 0 for i in range(len(history_df))]
 
-    # 综合得分
-    combined_scores = [0.4 * s + 0.3 * t + 0.3 * k for s, t, k in zip(similarities, theme_scores, sentiment_scores)]
+    # 综合得分 - 使用可配置的权重
+    # 获取当前权重配置
+    weights = get_article_weights()
+    content_weight = weights["content_similarity"]
+    theme_weight = weights["theme_match"]
+    sentiment_weight = weights["sentiment_match"]
+
+    # 应用权重计算综合得分
+    combined_scores = [
+        content_weight * s + theme_weight * t + sentiment_weight * k 
+        for s, t, k in zip(similarities, theme_scores, sentiment_scores)
+    ]
 
     # 获取TopN结果
     top_indices = np.array(combined_scores).argsort()[-top_n:][::-1]
@@ -490,8 +580,9 @@ if __name__ == "__main__":
     # 初始化缓存目录
     os.makedirs(CACHE_DIR, exist_ok=True)
 
-    sample_title = "汤阴警方速破地下室盗窃案 两寻宝盗贼落网"
-    sample_content = "大象新闻记者 于艳彬 通讯员 石小雨近日，汤阴县公安局快速出击，成功破获一起地下室盗窃案件，两名犯罪嫌疑人被警方抓获，被盗物品全部追回，有力维护了辖区群众的财产安全。3月7日上午8时许，汤阴县公安局韩庄派出所接到群众芦女士报警，称其位于小区地下室存放的4箱白酒被盗。接警后，民警迅速赶到案发现场。韩庄派出所秉持的原则，对地下室展开细致勘查，不放过任何细微线索。经过一番仔细搜寻，民警成功寻回3箱被盗白酒，但仍有1箱下落不明。为尽快挽回群众损失，民警立即调取了地下室及小区周边的监控视频，对每一个可疑人员进行仔细甄别。经过不懈努力，发现两名男子在案发时间段骑电动车在地下室附近徘徊，行迹十分可疑。民警循线追踪，发现两人最后消失在韩庄镇某村。面对线索中断的难题，办案民警毫不气馁。在县局合成作战中心的全力协助下，扩大监控排查范围，对海量视频资料逐一分析研判。经过连续两天的艰苦奋战，终于锁定了两名嫌疑人原某和常某的身份信息与活动轨迹。3月9日上午，抓捕时机成熟，民警在县城某小区经过数小时蹲守，成功将二人抓获，并当场查获被盗白酒一箱。经审讯，二人对盗窃行为供认不讳。据悉，原某与常某是朋友关系，因无所事事且手头拮据，便心生邪念，决定组团到小区地下室。案发当晚，两人先是尝试拉车门盗窃，但未有所获，随后将目标转向地下室，暴力踹开地下室门，盗走4箱白酒。因电动车无法一次性运走所有赃物，他们将3箱白酒藏于地下室角落，打算日后再来取，带着一箱白酒先行离开。没想到，还没来得及销赃，就被警方抓获。目前，两名嫌疑人已被公安机关依法采取刑事强制措施，案件正在进一步侦办中。汤阴警方始终保持对各类违法犯罪的高压态势，以实际行动守护群众的财产安全，全力维护社会治安稳定。编审：孙喜增"
+    sample_title = ""
+    sample_content = "臨近國慶節，香港中環街頭掛滿了慶祝中華人民共和國成立75周年標語，營造濃厚的慶祝國慶氛圍。（香港中通社記者  謝光磊 攝）  香港中通社圖片"
+
 
     recommendations = recommend_articles(sample_title, sample_content)
 

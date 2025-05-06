@@ -19,7 +19,6 @@ import uuid
 from datetime import datetime
 import logging
 
-#new
 
 
 #导入模型
@@ -27,8 +26,8 @@ import clip
 from models import db, User, Image, Tag, ImageTag, Caption, Favorite, Download, SearchHistory, ViewHistory, News
 
 #导入新闻推荐相关函数
-from novo2 import recommend_articles
-from novo1 import ImageRecommender,NewsAnalyzer
+from novo2 import recommend_articles, get_article_weights, set_article_weights
+from novo1 import ImageRecommender,NewsAnalyzer, get_current_weights, set_weights
 
 # 添加cn_clip导入
 from cn_clip.clip import load_from_name, tokenize
@@ -633,7 +632,7 @@ def get_tags():
 
 
 
-@app.route('/api/upload', methods=['POST'])
+@app.route('/api/upload', methods=['POST', 'OPTIONS'])
 @jwt_required()  # 添加JWT验证
 def upload_file():
     # 检查是否有文件
@@ -652,25 +651,31 @@ def upload_file():
     
     # 获取其他参数
     title_prefix = request.form.get('title', '')
-    tags_json = request.form.get('tags', '[]')
-    auto_caption =   request.form.get('description', '1') == '1'
-    description=""
+    auto_caption = request.form.get('description', '1') == '1'
+    description = ""
     if auto_caption == False:
-        description=request.form.get('description')
-    
-    try:
-        tags_list = json.loads(tags_json)
-    except:
-        tags_list = []
+        description = request.form.get('description')
     
     # 获取当前用户ID
     current_user_id = get_jwt_identity()
     
-    # 生成安全的文件名
-    filename = secure_filename(file.filename)
-    file_id = str(uuid.uuid4())
-    file_ext = filename.rsplit('.', 1)[1].lower()
-    new_filename = f"{file_id}.{file_ext}"
+    # 安全处理文件名
+    try:
+        original_filename = file.filename
+        # 获取文件扩展名
+        if '.' in original_filename:
+            file_ext = original_filename.rsplit('.', 1)[1].lower()
+        else:
+            file_ext = 'jpg'  # 默认扩展名
+            
+        # 生成唯一文件名
+        file_id = str(uuid.uuid4())
+        new_filename = f"{file_id}.{file_ext}"
+    except Exception as e:
+        print(f"处理文件名时出错: {e}")
+        # 出错时使用一个安全的默认值
+        file_id = str(uuid.uuid4())
+        new_filename = f"{file_id}.jpg"
     
     # 保存文件
     file_path = os.path.join(app.config['UPLOAD_FOLDER'], new_filename)
@@ -678,9 +683,9 @@ def upload_file():
     
     # 生成标题
     if title_prefix:
-        title = f"{title_prefix}_{filename}"
+        title = f"{title_prefix}"
     else:
-        title = filename
+        title = original_filename
     
     # 生成图片URL
     file_url = f"http://{Server_IP}/uploads/{new_filename}"
@@ -707,14 +712,6 @@ def upload_file():
     )
     db.session.add(new_image)
     
-    # 添加标签
-    for tag_name in tags_list:
-        tag = Tag.query.filter_by(name=tag_name).first()
-        if not tag:
-            tag = Tag(name=tag_name)
-            db.session.add(tag)
-        new_image.tags.append(tag)
-    
     # 添加描述
     captions = []
     if auto_caption:
@@ -724,7 +721,7 @@ def upload_file():
             new_image.captions.append(caption)
             captions.append(caption_text)
     else:
-        caption=Caption(caption=description)
+        caption = Caption(caption=description)
         new_image.captions.append(caption)
         captions.append(description)
 
@@ -1170,7 +1167,7 @@ def novo_get_recommendations_images():
             return jsonify({"error": "标题不能为空"}), 400
         
         news_elements=news_analyzer.analyze_news(title,content)
-        image_recommendations=image_recommender.recommend_images(news_elements)
+        image_recommendations=image_recommender.recommend_images(news_elements,use_fixed_weights=True)
         features = {
         "title": title,
         "事件内容": news_elements["核心事件"],
@@ -2110,6 +2107,163 @@ def init_application_data():
             print("个性化推荐系统初始化完成")
         except Exception as e:
             print(f"初始化推荐系统失败: {e}")
+
+# 添加获取当前权重的API
+@app.route('/api/weights', methods=['GET', 'OPTIONS'])
+def get_weights():
+    """获取当前推荐系统的权重配置"""
+    # 处理 OPTIONS 请求
+    if request.method == 'OPTIONS':
+        response = jsonify({'message': 'OK'})
+        response.headers.add('Access-Control-Allow-Methods', 'GET')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+        return response
+    
+    # 获取当前权重
+    current_weights = get_current_weights()
+    
+    return jsonify({
+        'success': True,
+        'weights': current_weights
+    })
+
+# 添加修改权重的API（仅管理员可用）
+@app.route('/api/weights', methods=['PUT', 'OPTIONS'])
+@jwt_required()
+def update_weights():
+    """更新推荐系统的权重配置（仅管理员可用）"""
+    # 处理 OPTIONS 请求
+    if request.method == 'OPTIONS':
+        response = jsonify({'message': 'OK'})
+        response.headers.add('Access-Control-Allow-Methods', 'PUT')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+        return response
+    
+    # 验证用户身份和管理员权限
+    current_user_id = get_jwt_identity()
+    current_user = User.query.get(current_user_id)
+    
+    if not current_user:
+        return jsonify({'error': '无效的用户身份'}), 401
+        
+    if not current_user.is_admin:
+        return jsonify({'error': '只有管理员才能更新权重配置'}), 403
+    
+    # 获取请求数据
+    data = request.get_json()
+    if not data or not isinstance(data.get('weights'), dict):
+        return jsonify({'error': '无效的权重数据'}), 400
+    
+    # 提取权重数据
+    new_weights = data.get('weights')
+    
+    # 验证权重字段
+    required_fields = [
+        "标题", "事件内容", "动作内容", "实体内容", 
+        "场景内容", "情感内容", "隐喻内容", "数据内容"
+    ]
+    
+    for field in required_fields:
+        if field not in new_weights:
+            return jsonify({'error': f'缺少必要的权重字段: {field}'}), 400
+        try:
+            new_weights[field] = float(new_weights[field])
+            if new_weights[field] < 0:
+                return jsonify({'error': f'权重值不能为负: {field}'}), 400
+        except:
+            return jsonify({'error': f'权重值必须是数字: {field}'}), 400
+    
+    # 更新权重
+    if set_weights(new_weights, is_admin=True):
+        return jsonify({
+            'success': True,
+            'message': '权重配置已更新',
+            'weights': get_current_weights()
+        })
+    else:
+        return jsonify({'error': '更新权重配置失败'}), 500
+
+# 添加获取文章推荐权重的API
+@app.route('/api/article-weights', methods=['GET', 'OPTIONS'])
+def get_article_weights_api():
+    """获取当前文章推荐系统的权重配置"""
+    # 处理 OPTIONS 请求
+    if request.method == 'OPTIONS':
+        response = jsonify({'message': 'OK'})
+        response.headers.add('Access-Control-Allow-Methods', 'GET')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+        return response
+    
+    # 获取当前权重
+    current_weights = get_article_weights()
+    
+    return jsonify({
+        'success': True,
+        'weights': current_weights
+    })
+
+# 添加修改文章推荐权重的API（仅管理员可用）
+@app.route('/api/article-weights', methods=['PUT', 'OPTIONS'])
+@jwt_required()
+def update_article_weights():
+    """更新文章推荐系统的权重配置（仅管理员可用）"""
+    # 处理 OPTIONS 请求
+    if request.method == 'OPTIONS':
+        response = jsonify({'message': 'OK'})
+        response.headers.add('Access-Control-Allow-Methods', 'PUT')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+        return response
+    
+    # 验证用户身份和管理员权限
+    current_user_id = get_jwt_identity()
+    current_user = User.query.get(current_user_id)
+    
+    if not current_user:
+        return jsonify({'error': '无效的用户身份'}), 401
+        
+    if not current_user.is_admin:
+        return jsonify({'error': '只有管理员才能更新权重配置'}), 403
+    
+    # 获取请求数据
+    data = request.get_json()
+    if not data or not isinstance(data.get('weights'), dict):
+        return jsonify({'error': '无效的权重数据'}), 400
+    
+    # 提取权重数据
+    new_weights = data.get('weights')
+    
+    # 验证权重字段
+    required_fields = [
+        "content_similarity", "theme_match", "sentiment_match"
+    ]
+    
+    for field in required_fields:
+        if field not in new_weights:
+            return jsonify({'error': f'缺少必要的权重字段: {field}'}), 400
+        try:
+            new_weights[field] = float(new_weights[field])
+            if new_weights[field] < 0:
+                return jsonify({'error': f'权重值不能为负: {field}'}), 400
+        except:
+            return jsonify({'error': f'权重值必须是数字: {field}'}), 400
+    
+    # 确保权重总和为1
+    total = sum(new_weights.values())
+    if abs(total - 1.0) > 0.01:
+        # 自动归一化
+        new_weights = {k: v/total for k, v in new_weights.items()}
+    
+    # 更新权重
+    if set_article_weights(new_weights, is_admin=True):
+        return jsonify({
+            'success': True,
+            'message': '文章推荐权重配置已更新',
+            'weights': get_article_weights()
+        })
+    else:
+        return jsonify({'error': '更新文章推荐权重配置失败'}), 500
+
+
 
 if __name__ == '__main__':
     print("后端服务启动中...")

@@ -16,6 +16,76 @@ import base64
 from datetime import datetime
 from novo2 import batch_get_keywords, batch_text_embedding, preprocess_text
 
+# 全局固定权重配置
+DEFAULT_WEIGHTS = {
+    "标题": 0.3,  # 标题通常包含核心信息，权重较高
+    "事件内容": 0.25,  # 核心事件是新闻的核心语义单元
+    "动作内容": 0.05,  # 关键动作描述事件动态
+    "实体内容": 0.25,  # 显著实体（人名、机构名）是重要匹配线索
+    "场景内容": 0.08,  # 场景特征（时间、地点）辅助定位
+    "情感内容": 0.03,  # 情感倾向对视觉氛围有影响，但权重较低
+    "隐喻内容": 0.02,  # 视觉隐喻较抽象，权重最低
+    "数据内容": 0.02,  # 数据统计作为补充信息
+}
+
+# 确保权重和为1
+total_weight = sum(DEFAULT_WEIGHTS.values())
+GLOBAL_WEIGHTS = {k: v / total_weight for k, v in DEFAULT_WEIGHTS.items()}
+
+# 权重配置文件路径
+WEIGHTS_CONFIG_PATH = "weights_config.json"
+
+# 加载已保存的权重配置（如果存在）
+def load_weights_config():
+    global GLOBAL_WEIGHTS
+    try:
+        if os.path.exists(WEIGHTS_CONFIG_PATH):
+            with open(WEIGHTS_CONFIG_PATH, 'r', encoding='utf-8') as f:
+                weights = json.load(f)
+                # 验证权重配置是否完整
+                if all(k in weights for k in DEFAULT_WEIGHTS.keys()):
+                    # 确保权重和为1
+                    total = sum(weights.values())
+                    GLOBAL_WEIGHTS = {k: v / total for k, v in weights.items()}
+                    print(f"已加载自定义权重配置: {GLOBAL_WEIGHTS}")
+                    return GLOBAL_WEIGHTS
+    except Exception as e:
+        print(f"加载权重配置出错: {e}")
+    
+    print(f"使用默认权重配置: {GLOBAL_WEIGHTS}")
+    return GLOBAL_WEIGHTS
+
+# 保存权重配置
+def save_weights_config(weights):
+    try:
+        with open(WEIGHTS_CONFIG_PATH, 'w', encoding='utf-8') as f:
+            json.dump(weights, f, ensure_ascii=False, indent=2)
+        print(f"权重配置已保存到: {WEIGHTS_CONFIG_PATH}")
+        return True
+    except Exception as e:
+        print(f"保存权重配置出错: {e}")
+        return False
+
+# 更新全局权重配置
+def update_weights(new_weights):
+    global GLOBAL_WEIGHTS
+    # 验证权重配置是否完整
+    if not all(k in new_weights for k in DEFAULT_WEIGHTS.keys()):
+        print("权重配置不完整，更新失败")
+        return False
+    
+    # 确保权重和为1
+    total = sum(new_weights.values())
+    GLOBAL_WEIGHTS = {k: v / total for k, v in new_weights.items()}
+    
+    # 保存到文件
+    if save_weights_config(GLOBAL_WEIGHTS):
+        return True
+    return False
+
+# 加载初始权重配置
+load_weights_config()
+
 class NewsAnalyzer:
     """新闻信息提取器类"""
     
@@ -150,9 +220,7 @@ class NewsAnalyzer:
         # 分析情感和主题
         sentiment, topic = self.analyze_news_sentiment_topic(content)
         
-        # 获取新闻要素（用于嵌入向量计算）
-        news_elements = self.analyze_news(title, content)
-        
+
         # 创建文本嵌入向量
         text_for_embedding = f"{title} {content}"
         try:
@@ -160,22 +228,15 @@ class NewsAnalyzer:
             cache_dir = "cache_data"
             os.makedirs(cache_dir, exist_ok=True)
             
-            # 预处理文本
-            processed_text = preprocess_text(text_for_embedding)
-            
             # 提取关键词
-            keywords = batch_get_keywords([processed_text])[0]
+            keywords = batch_get_keywords([text_for_embedding])[0]
             keyword_text = "".join(keywords)
             
             # 生成嵌入向量
             embedding = batch_text_embedding([keyword_text])[0]
             
-            # 归一化向量
-            norm = np.linalg.norm(embedding)
-            if norm > 0:
-                embedding = embedding / norm
-            
-            embedding_pickle = pickle.dumps(embedding)
+            embedding_list=embedding.tolist()
+            embedding_pickle = pickle.dumps(embedding_list)
         except Exception as e:
             print(f"计算新闻嵌入向量时出错: {e}")
             embedding_pickle = None
@@ -202,7 +263,6 @@ class NewsAnalyzer:
                 "content": content[:200] + "..." if len(content) > 200 else content,
                 "sentiment": sentiment,
                 "topic": topic,
-                "elements": news_elements,
                 "save_success": True
             }
         except Exception as e:
@@ -213,7 +273,6 @@ class NewsAnalyzer:
                 "content": content[:200] + "..." if len(content) > 200 else content,
                 "sentiment": sentiment,
                 "topic": topic,
-                "elements": news_elements,
                 "save_success": False,
                 "error": str(e)
             }
@@ -240,6 +299,16 @@ class NewsAnalyzer:
         5. 情感内容(丰富)
         6. 视觉隐喻（象征性元素）
         7. 数据统计（新闻中的数据和统计信息）
+        输出必须使用如下格式：
+        {
+            "核心事件": [...],
+            "关键动作": [...],
+            "显著实体": [...],
+            "场景特征": [...],
+            "情感内容": [...],
+            "视觉隐喻": [...],
+            "数据统计": [...]
+        }
         """
         
         # 构建输入文本
@@ -463,123 +532,20 @@ class ImageRecommender:
     
     def optimize_weights(self, news_elements, n_trials=200):
         """优化各要素权重"""
-        def objective(trial):
-            weight_params = {
-                "标题": trial.suggest_float("标题", 0.1, 0.4),
-                "事件内容": trial.suggest_float("事件内容", 0.1, 0.4),
-                "动作内容": trial.suggest_float("动作内容", 0.1, 0.3),
-                "实体内容": trial.suggest_float("实体内容", 0.1, 0.3),
-                "场景内容": trial.suggest_float("场景内容", 0, 0.3),
-                "情感内容": trial.suggest_float("情感内容", 0, 0.2),
-                "隐喻内容": trial.suggest_float("隐喻内容", 0, 0.2),
-                "数据内容": trial.suggest_float("数据内容", 0, 0.2),
-            }
-            
-            total_weight = sum(weight_params.values())
-            if total_weight == 0:
-                return 0
-            weights = {k: v / total_weight for k, v in weight_params.items()}
-            
-            weighted_feat = np.zeros((1, 512))
-            for field, weight in weights.items():
-                text = str(news_elements.get(field, ""))
-                if text and weight > 0:  # 确保文本不为空且权重大于0
-                    try:
-                        feat = self.encode_text(text)
-                        weighted_feat += weight * feat
-                    except Exception as e:
-                        print(f"编码文本时出错: {e}")
-                        continue  # 跳过有问题的特征
-            
-            # 检查向量是否有效
-            if np.isnan(weighted_feat).any() or np.sum(weighted_feat) == 0:
-                return 0  # 返回一个有效值而非NaN
-                
-            # 归一化向量，添加检查避免除以零
-            norm = np.linalg.norm(weighted_feat)
-            if norm > 0:
-                weighted_feat /= norm
-            else:
-                return 0  # 避免除以零
-            
-            # 计算相似度
-            similarities = []
-            for img_name, img_feat in self.image_features.items():
-                try:
-                    # 修复点积计算，确保形状兼容
-                    # 确保img_feat是正确的形状
-                    if len(img_feat.shape) == 1:
-                        # 如果是一维数组，重塑为二维
-                        img_feat = img_feat.reshape(1, -1)
-                    elif len(img_feat.shape) > 2:
-                        # 如果维度过高，展平为二维
-                        img_feat = img_feat.reshape(1, -1)
-                    
-                    # 执行点积
-                    sim = np.dot(weighted_feat, img_feat.T)
-                    
-                    # 安全地获取点积结果
-                    if isinstance(sim, np.ndarray):
-                        if sim.size == 1:
-                            sim_value = float(sim.item())
-                        else:
-                            sim_value = float(sim[0, 0])
-                    else:
-                        sim_value = float(sim)
-                    
-                    # 检查NaN或无穷大
-                    if not np.isnan(sim_value) and not np.isinf(sim_value):
-                        similarities.append(sim_value)
-                except Exception as e:
-                    print(f"计算相似度时出错: {e}")
-                    continue
-            
-            # 确保有足够的结果
-            if len(similarities) < 5:
-                return 0
-                
-            top5_sim = np.sort(similarities)[-5:].sum()
-            return top5_sim  # 我们想要最大化这个值，不需要负号
-        
-        try:
-            study = optuna.create_study(direction="maximize", 
-                                      sampler=optuna.samplers.TPESampler())
-            study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
-            
-            if study.best_trial is None:
-                print("优化失败，使用默认权重")
-                return {
-                    "标题": 0.3,
-                    "事件内容": 0.3,
-                    "动作内容": 0.2,
-                    "实体内容": 0.2,
-                    "场景内容": 0.1,
-                    "情感内容": 0.1,
-                    "隐喻内容": 0.1,
-                    "数据内容": 0.0
-                }
-            return study.best_params
-        except Exception as e:
-            print(f"优化过程中发生错误: {e}")
-            # 返回默认权重
-            return {
-                "标题": 0.3,
-                "事件内容": 0.3,
-                "动作内容": 0.2,
-                "实体内容": 0.2,
-                "场景内容": 0.1,
-                "情感内容": 0.1,
-                "隐喻内容": 0.1,
-                "数据内容": 0.0
-            }
+        # 使用全局固定权重设置，不再进行优化
+        print("\n使用全局固定权重:")
+        for field, weight in GLOBAL_WEIGHTS.items():
+            print(f"{field}: {weight:.4f}")
+        return GLOBAL_WEIGHTS.copy()
     
-    def recommend_images(self, news_elements, top_n=10):
+    def recommend_images(self, news_elements, top_n=10, use_fixed_weights=True):
         """
         为新闻推荐图片
         
         参数:
             news_elements: 新闻要素字典
             top_n: 返回的推荐图片数量
+            use_fixed_weights: 是否使用固定权重，默认为True
             
         返回:
             list: 包含(图片URL, 相似度)元组的列表
@@ -589,9 +555,15 @@ class ImageRecommender:
             print("没有找到任何有效图片")
             return []
             
-        # 优化权重
-        best_weights = self.optimize_weights(news_elements)
-        print("\n最优权重:")
+        # 获取权重
+        if use_fixed_weights:
+            best_weights = GLOBAL_WEIGHTS.copy()
+            print("\n使用全局固定权重:")
+        else:
+            # 使用优化权重（原始方法）
+            best_weights = self.optimize_weights(news_elements)
+            print("\n使用优化权重:")
+            
         for field, weight in best_weights.items():
             print(f"{field}: {weight:.4f}")
         
@@ -680,6 +652,28 @@ class ImageRecommender:
         except Exception as e:
             print(f"关闭数据库连接时出错: {e}")
 
+# 以下是权重管理相关函数
+
+def get_current_weights():
+    """获取当前全局权重配置"""
+    return GLOBAL_WEIGHTS.copy()
+
+def set_weights(new_weights, is_admin=False):
+    """
+    设置全局权重配置
+    
+    参数:
+        new_weights: 新的权重字典
+        is_admin: 是否是管理员，只有管理员才能修改权重
+        
+    返回:
+        bool: 是否成功更新权重
+    """
+    if not is_admin:
+        print("只有管理员才能修改权重配置")
+        return False
+    
+    return update_weights(new_weights)
 
 def main():
     """主函数示例"""
@@ -707,9 +701,10 @@ def main():
     # 步骤2：推荐图片
     image_dir = "./CNA_images"
     recommender = ImageRecommender(image_dir, db_config)
-    recommendations = recommender.recommend_images(news_elements)
     
-
+    # 使用固定权重
+    recommendations = recommender.recommend_images(news_elements, use_fixed_weights=True)
+    
     features = {
         "title": title,
         "事件内容": news_elements["核心事件"],
