@@ -14,6 +14,7 @@ from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
 from LLM import LLMClient
 import json
+from datetime import datetime, timedelta
 
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'  # 避免内存碎片化
@@ -29,6 +30,7 @@ KEYWORD_CACHE = os.path.join(CACHE_DIR, "keywords_cache.pkl")  # 关键词缓存
 BATCH_SIZE = 32  # 批量处理大小
 NUM_WORKERS = 4  # 并行工作线程数
 WEIGHTS_CONFIG_PATH = "article_weights_config.json"  # 文章推荐权重配置文件
+TIME_RANGE_CONFIG_PATH = "article_time_range_config.json"  # 文章时间范围配置文件
 
 # 默认权重配置
 DEFAULT_ARTICLE_WEIGHTS = {
@@ -37,8 +39,16 @@ DEFAULT_ARTICLE_WEIGHTS = {
     "sentiment_match": 0.3      # 情感匹配权重
 }
 
+# 默认时间范围配置（天数）
+DEFAULT_TIME_RANGE = {
+    "days": 0  # 0表示不限制时间范围
+}
+
 # 全局权重变量
 ARTICLE_WEIGHTS = DEFAULT_ARTICLE_WEIGHTS.copy()
+
+# 全局时间范围变量
+TIME_RANGE = DEFAULT_TIME_RANGE.copy()
 
 # 加载权重配置
 def load_article_weights():
@@ -62,6 +72,23 @@ def load_article_weights():
     
     print(f"使用默认文章推荐权重配置: {ARTICLE_WEIGHTS}")
     return ARTICLE_WEIGHTS
+
+# 加载时间范围配置
+def load_time_range():
+    """加载文章推荐时间范围配置"""
+    global TIME_RANGE
+    try:
+        if os.path.exists(TIME_RANGE_CONFIG_PATH):
+            with open(TIME_RANGE_CONFIG_PATH, 'r', encoding='utf-8') as f:
+                time_range = json.load(f)
+                if "days" in time_range:
+                    TIME_RANGE = time_range
+                    print(f"已加载文章推荐时间范围配置: 过去{TIME_RANGE['days']}天内的文章")
+                    return TIME_RANGE
+    except Exception as e:
+        print(f"加载文章推荐时间范围配置出错: {e}")
+    
+    return TIME_RANGE
 
 # 保存权重配置
 def save_article_weights(weights):
@@ -90,10 +117,43 @@ def save_article_weights(weights):
         print(f"保存文章推荐权重配置出错: {e}")
         return False
 
+# 保存时间范围配置
+def save_time_range(time_range):
+    """保存文章推荐时间范围配置"""
+    try:
+        if "days" not in time_range:
+            print("时间范围配置不完整，保存失败")
+            return False
+        
+        # 确保days是非负整数
+        days = int(time_range["days"])
+        if days < 0:
+            days = 0
+        
+        time_range = {"days": days}
+        
+        with open(TIME_RANGE_CONFIG_PATH, 'w', encoding='utf-8') as f:
+            json.dump(time_range, f, ensure_ascii=False, indent=2)
+        
+        # 更新全局变量
+        global TIME_RANGE
+        TIME_RANGE = time_range
+        
+        print(f"文章推荐时间范围配置已保存: {TIME_RANGE_CONFIG_PATH}")
+        return True
+    except Exception as e:
+        print(f"保存文章推荐时间范围配置出错: {e}")
+        return False
+
 # 获取当前权重
 def get_article_weights():
     """获取当前文章推荐权重配置"""
     return ARTICLE_WEIGHTS
+
+# 获取当前时间范围
+def get_time_range():
+    """获取当前文章推荐时间范围配置"""
+    return TIME_RANGE
 
 # 设置权重
 def set_article_weights(new_weights, is_admin=False):
@@ -104,8 +164,18 @@ def set_article_weights(new_weights, is_admin=False):
     
     return save_article_weights(new_weights)
 
-# 初始化加载权重
+# 设置时间范围
+def set_time_range(new_time_range, is_admin=False):
+    """更新文章推荐时间范围配置（仅管理员可用）"""
+    if not is_admin:
+        print("只有管理员可以更新时间范围配置")
+        return False
+    
+    return save_time_range(new_time_range)
+
+# 初始化加载权重和时间范围
 load_article_weights()
+load_time_range()
 
 # ================== 初始化模型 ==================
 # 中文BERT模型（关键词提取）
@@ -329,6 +399,8 @@ def analyze_news(news):
 # ================== 历史文章预加载 ==================
 def load_history_data(history_file):
     """加载并预处理历史数据"""
+    from datetime import datetime
+    
     # 检查文件扩展名
     if history_file.endswith('.xlsx') or history_file.endswith('.xls'):
         df = pd.read_excel(history_file)
@@ -350,6 +422,16 @@ def load_history_data(history_file):
     
     # 去重
     df = df.drop_duplicates(subset=['新闻内容'])
+
+    # 确保数据有upload_time列
+    if 'upload_time' not in df.columns:
+        # 为每一行添加当前时间作为上传时间
+        df['upload_time'] = datetime.now()
+    else:
+        # 确保upload_time是datetime类型
+        df['upload_time'] = pd.to_datetime(df['upload_time'], errors='coerce')
+        # 如果转换后有NaT值，使用当前时间代替
+        df.loc[df['upload_time'].isna(), 'upload_time'] = datetime.now()
 
     # 预生成所有历史文章的向量
     if not os.path.exists(HISTORY_EMB_CACHE):
@@ -378,9 +460,18 @@ def load_history_data(history_file):
             df = df.rename(columns={'新闻文本': '新闻内容'})
         if '情感' in df.columns and '分类结果' not in df.columns:
             df = df.rename(columns={'情感': '分类结果'})
+        
+        # 确保有upload_time列
+        if 'upload_time' not in df.columns:
+            df['upload_time'] = datetime.now()
+        else:
+            # 确保upload_time是datetime类型
+            df['upload_time'] = pd.to_datetime(df['upload_time'], errors='coerce')
+            # 如果转换后有NaT值，使用当前时间代替
+            df.loc[df['upload_time'].isna(), 'upload_time'] = datetime.now()
 
     # 验证列名是否正确
-    required_columns = ['新闻内容', '主题', '分类结果', 'embedding']
+    required_columns = ['新闻内容', '主题', '分类结果', 'embedding', 'upload_time']
     for col in required_columns:
         if col not in df.columns:
             print(f"错误: 缺少必要的列 '{col}'，当前列: {df.columns.tolist()}")
@@ -391,6 +482,8 @@ def load_history_data(history_file):
                 df['主题'] = df['theme']
             elif col == '分类结果' and 'label' in df.columns:
                 df['分类结果'] = df['label']
+            elif col == 'upload_time':
+                df['upload_time'] = datetime.now()
             # 如果没有可复制的列，创建默认值
             elif col == '新闻内容':
                 df['新闻内容'] = ['无内容'] * len(df)
@@ -422,6 +515,16 @@ def load_news_from_db(db_session, News, top_n=None):
     # 查询有嵌入向量的新闻
     query = db_session.query(News).filter(News.embedding != None)
     
+    # 应用时间范围过滤
+    time_range = get_time_range()
+    days = time_range.get("days", 0)
+    if days > 0:
+        # 计算截止日期
+        cutoff_date = datetime.now() - timedelta(days=days)
+        # 过滤出指定日期范围内的新闻
+        query = query.filter(News.upload_time >= cutoff_date)
+        print(f"应用时间过滤: 仅包含过去{days}天内的新闻")
+    
     # 如果指定了数量限制
     if top_n:
         query = query.limit(top_n)
@@ -443,6 +546,43 @@ def load_news_from_db(db_session, News, top_n=None):
     })
     
     return df
+
+
+# ================== 辅助函数 ==================
+def filter_by_time_range(df):
+    """根据当前时间范围配置过滤DataFrame"""
+    # 获取时间范围配置
+    time_range = get_time_range()
+    days = time_range.get("days", 0)
+    
+    # 如果没有设置时间范围限制，直接返回原始数据
+    if days <= 0:
+        return df
+    
+    print(f"应用时间过滤: 仅包含过去{days}天内的新闻")
+    
+    # 确保DataFrame中有upload_time列
+    if 'upload_time' not in df.columns:
+        print("警告: DataFrame中没有上传时间列，无法应用时间过滤")
+        return df
+    
+    # 计算截止日期
+    cutoff_date = datetime.now() - timedelta(days=days)
+    
+    # 过滤DataFrame
+    try:
+        # 确保upload_time是datetime类型
+        if df['upload_time'].dtype != 'datetime64[ns]':
+            df['upload_time'] = pd.to_datetime(df['upload_time'], errors='coerce')
+        
+        # 应用过滤条件
+        filtered_df = df[df['upload_time'] >= cutoff_date]
+        print(f"时间过滤前: {len(df)}条记录，过滤后: {len(filtered_df)}条记录")
+        
+        return filtered_df
+    except Exception as e:
+        print(f"应用时间过滤时出错: {e}")
+        return df
 
 
 # ================== 修改后的推荐函数 ==================
@@ -474,14 +614,23 @@ def recommend_articles(input_title, input_content, db_session=None, News=None, h
     
     # 加载历史数据
     if use_db and db_session and News:
-        # 从数据库加载
+        # 从数据库加载（已包含时间过滤）
         history_df = load_news_from_db(db_session, News)
         if history_df is None or len(history_df) == 0:
             print("数据库中没有找到有效的新闻记录，将使用历史文件")
             history_df = load_history_data(history_file)
+            # 如果从文件加载，需要手动应用时间过滤
+            history_df = filter_by_time_range(history_df)
     else:
         # 从Excel/CSV文件加载（带缓存）
         history_df = load_history_data(history_file)
+        # 应用时间过滤
+        history_df = filter_by_time_range(history_df)
+    
+    # 如果过滤后没有文章，则返回空结果
+    if history_df is None or len(history_df) == 0:
+        print("过滤后没有可用的历史文章")
+        return []
 
     # 清除输入文章的关键词缓存
     if os.path.exists(KEYWORD_CACHE):
@@ -561,6 +710,9 @@ def recommend_articles(input_title, input_content, db_session=None, News=None, h
                 "sentiment": row['分类结果'],
                 "similarity": round(float(combined_scores[idx]), 4)
             }
+            # 添加上传时间（如果有）
+            if 'upload_time' in row:
+                result["upload_time"] = row['upload_time'].isoformat() if hasattr(row['upload_time'], 'isoformat') else str(row['upload_time'])
         else:
             result = {
                 "id": idx,
@@ -569,6 +721,9 @@ def recommend_articles(input_title, input_content, db_session=None, News=None, h
                 "label": row['分类结果'],
                 "similarity": round(float(combined_scores[idx]), 4)
             }
+            # 添加上传时间（如果有）
+            if 'upload_time' in row:
+                result["upload_time"] = row['upload_time'].isoformat() if hasattr(row['upload_time'], 'isoformat') else str(row['upload_time'])
             
         results.append(result)
 

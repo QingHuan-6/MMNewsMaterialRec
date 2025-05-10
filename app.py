@@ -27,6 +27,7 @@ from models import db, User, Image, Tag, ImageTag, Caption, Favorite, Download, 
 
 #导入新闻推荐相关函数
 from novo2 import recommend_articles, get_article_weights, set_article_weights
+from novo2 import get_time_range, set_time_range
 from novo1 import ImageRecommender,NewsAnalyzer, get_current_weights, set_weights
 
 # 添加cn_clip导入
@@ -107,7 +108,7 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 限制上传文件大小为16MB
 
 # 配置数据库连接
-app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+pymysql://root:123456@localhost/pixtock'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+pymysql://root:123456@localhost/pixtock?charset=utf8mb4&init_command=SET%20time_zone%3D%27%2B08%3A00%27'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db.init_app(app)
 print("数据库连接成功")
@@ -385,7 +386,7 @@ def get_upload_image(filename):
 
 @app.route('/api/images/search', methods=['GET'])
 def search_images():
-    """通过关键词搜索图片 (使用CN-CLIP模型查找相似图片)"""
+    """通过关键词搜索图片 (结合文本匹配和CN-CLIP模型查找相似图片)"""
     start_time = time.time()
     print(f"开始搜索...")
     
@@ -412,8 +413,30 @@ def search_images():
         print(f"记录检索历史时出错: {str(e)}")
         # 错误不影响搜索功能，继续执行
     
-    # 使用CN-CLIP搜索相似图片
     try:
+        # 第一步：从数据库查找描述中包含搜索关键词的图片
+        relevant_images = []
+        description_matches = db.session.query(Image).join(Caption).filter(
+            Caption.caption.like(f"%{query}%")
+        ).all()
+        
+        # 记录匹配描述的图片ID，避免重复
+        matched_image_ids = set()
+        for img in description_matches:
+            matched_image_ids.add(img.id)
+            # 添加到结果中，相似度设为1.0（最高）表示直接匹配
+            relevant_images.append({
+                'id': img.id,
+                'url': img.url,
+                'original_url': img.original_url,
+                'title': img.title,
+                'captions': [c.caption for c in img.captions],
+                'tags': [],
+                'score': 1.0,
+                'match_type': '描述匹配'
+            })
+        
+        # 第二步：使用CN-CLIP模型搜索语义相关图片
         text_inputs = tokenize([query]).to(device)
         with torch.no_grad():
             text_embedding = cn_clip_model.encode_text(text_inputs).cpu().numpy()
@@ -425,8 +448,7 @@ def search_images():
         top_k = 100  # 返回前100个结果
         indices = np.argsort(-similarities)[:top_k]
         
-        # 构建搜索结果
-        search_results = []
+        # 构建余下搜索结果（不包括已经通过描述匹配的图片）
         for idx in indices:
             img_file = image_files_list[idx]
             score = float(similarities[idx])
@@ -434,19 +456,32 @@ def search_images():
             # 获取图片ID
             image_id = img_file.split('.')[0]
             
+            # 跳过已经通过描述匹配的图片
+            if image_id in matched_image_ids:
+                continue
+            
             # 从数据库获取图片信息
             image = Image.query.get(image_id)
             
             if image:
-                search_results.append({
+                relevant_images.append({
                     'id': image_id,
                     'url': image.url,
                     'original_url': image.original_url,
                     'title': image.title,
-                    'captions': [],
+                    'captions': [c.caption for c in image.captions],
                     'tags': [],
-                    'score': score
+                    'score': score,
+                    'match_type': '语义相关'
                 })
+        
+        # 按相似度降序排序结果
+        search_results = sorted(relevant_images, key=lambda x: x['score'], reverse=True)
+        
+        # 移除match_type字段，保持API兼容性
+        for item in search_results:
+            if 'match_type' in item:
+                del item['match_type']
         
         print(f"搜索完成，找到 {len(search_results)} 个结果，耗时: {time.time() - start_time:.4f}秒")
         
@@ -461,6 +496,7 @@ def search_images():
         import traceback
         traceback.print_exc()
         return jsonify({'error': f'搜索处理失败: {str(e)}'}), 500
+
 
 @app.route('/api/images/<image_id>/similar', methods=['GET'])
 def get_similar_images(image_id):
@@ -635,6 +671,13 @@ def get_tags():
 @app.route('/api/upload', methods=['POST', 'OPTIONS'])
 @jwt_required()  # 添加JWT验证
 def upload_file():
+     # 处理 OPTIONS 请求
+    if request.method == 'OPTIONS':
+        response = jsonify({'status': 'ok'})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+        response.headers.add('Access-Control-Allow-Methods', 'POST,OPTIONS')
+        return response
     # 检查是否有文件
     if 'file' not in request.files:
         return jsonify({'error': 'No file part'}), 400
@@ -1167,7 +1210,7 @@ def novo_get_recommendations_images():
             return jsonify({"error": "标题不能为空"}), 400
         
         news_elements=news_analyzer.analyze_news(title,content)
-        image_recommendations=image_recommender.recommend_images(news_elements,use_fixed_weights=True)
+        image_recommendations=image_recommender.recommend_images(news_elements,title,content,use_fixed_weights=True)
         features = {
         "title": title,
         "事件内容": news_elements["核心事件"],
@@ -2263,6 +2306,197 @@ def update_article_weights():
     else:
         return jsonify({'error': '更新文章推荐权重配置失败'}), 500
 
+# 添加获取时间范围的API
+@app.route('/api/article-time-range', methods=['GET', 'OPTIONS'])
+def get_article_time_range_api():
+    """获取当前文章推荐时间范围配置"""
+    # 处理 OPTIONS 请求
+    if request.method == 'OPTIONS':
+        response = jsonify({'message': 'OK'})
+        response.headers.add('Access-Control-Allow-Methods', 'GET')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+        return response
+    
+    # 获取当前时间范围
+    current_time_range = get_time_range()
+    
+    return jsonify({
+        'success': True,
+        'time_range': current_time_range
+    })
+
+# 添加修改时间范围的API（仅管理员可用）
+@app.route('/api/article-time-range', methods=['PUT', 'OPTIONS'])
+@jwt_required()
+def update_article_time_range():
+    """更新文章推荐系统的时间范围配置（仅管理员可用）"""
+    # 处理 OPTIONS 请求
+    if request.method == 'OPTIONS':
+        response = jsonify({'message': 'OK'})
+        response.headers.add('Access-Control-Allow-Methods', 'PUT')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+        return response
+    
+    # 验证用户身份和管理员权限
+    current_user_id = get_jwt_identity()
+    current_user = User.query.get(current_user_id)
+    
+    if not current_user:
+        return jsonify({'error': '无效的用户身份'}), 401
+        
+    if not current_user.is_admin:
+        return jsonify({'error': '只有管理员才能更新时间范围配置'}), 403
+    
+    # 获取请求数据
+    data = request.get_json()
+    if not data or 'days' not in data:
+        return jsonify({'error': '无效的时间范围数据'}), 400
+    
+    # 提取时间范围数据
+    try:
+        days = int(data['days'])
+        if days < 0:
+            days = 0  # 确保天数为非负整数
+    except (ValueError, TypeError):
+        return jsonify({'error': '天数必须是整数'}), 400
+    
+    # 更新时间范围
+    new_time_range = {"days": days}
+    if set_time_range(new_time_range, is_admin=True):
+        return jsonify({
+            'success': True,
+            'message': '时间范围配置已更新',
+            'time_range': get_time_range()
+        })
+    else:
+        return jsonify({'error': '更新时间范围配置失败'}), 500
+
+@app.route('/api/batch-upload', methods=['POST', 'OPTIONS'])
+@jwt_required()  # 添加JWT验证
+def batch_upload_files():
+    """批量上传图片接口，支持同时上传多张图片
+    前端可以发送多个文件，标题默认为文件名，描述为空
+    """
+    # 处理OPTIONS请求
+    if request.method == 'OPTIONS':
+        response = jsonify({'status': 'ok'})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+        response.headers.add('Access-Control-Allow-Methods', 'POST,OPTIONS')
+        return response
+    
+    # 检查是否有文件
+    if 'files[]' not in request.files:
+        return jsonify({'error': '没有接收到文件'}), 400
+    
+    # 获取当前用户ID
+    current_user_id = get_jwt_identity()
+    
+    # 获取所有文件
+    files = request.files.getlist('files[]')
+    
+    # 验证是否有文件
+    if len(files) == 0:
+        return jsonify({'error': '没有选择文件'}), 400
+    
+    # 处理结果
+    results = {
+        'success': 0,
+        'failed': 0,
+        'total': len(files),
+        'images': []
+    }
+    
+    # 批量处理每个文件
+    for file in files:
+        # 检查文件名是否为空
+        if file.filename == '':
+            results['failed'] += 1
+            continue
+        
+        # 检查文件类型
+        if not allowed_file(file.filename):
+            results['failed'] += 1
+            continue
+        
+        try:
+            # 安全处理文件名
+            original_filename = file.filename
+            
+            # 获取文件扩展名
+            if '.' in original_filename:
+                file_ext = original_filename.rsplit('.', 1)[1].lower()
+            else:
+                file_ext = 'jpg'  # 默认扩展名
+                
+            # 生成唯一文件名
+            file_id = str(uuid.uuid4())
+            new_filename = f"{file_id}.{file_ext}"
+            
+            # 从原始文件名提取标题（移除路径和扩展名）
+            title = os.path.basename(original_filename)
+            if '.' in title:
+                title = title.rsplit('.', 1)[0]
+            
+            # 保存文件
+            file_path = os.path.join(app.config['UPLOAD_FOLDER'], new_filename)
+            file.save(file_path)
+            
+            # 生成图片URL
+            file_url = f"http://{Server_IP}/uploads/{new_filename}"
+            
+            # 计算图片嵌入向量
+            try:
+                image = cn_preprocess(PIL.Image.open(file_path).convert("RGB")).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    embedding = cn_clip_model.encode_image(image).cpu().numpy()[0]
+                embedding_bytes = pickle.dumps(embedding)
+            except Exception as e:
+                print(f"计算嵌入向量失败: {e}")
+                embedding_bytes = None
+            
+            # 创建图片记录
+            new_image = Image(
+                id=file_id,
+                title=title,
+                file_path=file_path,
+                url=file_url,
+                original_url=file_url,
+                embedding=embedding_bytes,
+                user_id=current_user_id  # 设置用户ID
+            )
+            db.session.add(new_image)
+            
+            # 添加空描述
+            caption = Caption(caption="")
+            new_image.captions.append(caption)
+            
+            # 记录成功
+            results['success'] += 1
+            results['images'].append({
+                'id': file_id,
+                'title': title,
+                'url': file_url,
+                'original_url': file_url
+            })
+            
+        except Exception as e:
+            print(f"处理文件时出错: {e}")
+            results['failed'] += 1
+            continue
+    
+    # 提交到数据库（一次性提交所有成功的记录）
+    if results['success'] > 0:
+        db.session.commit()
+        # 更新内存中的嵌入向量和文件列表
+        load_embeddings_from_db()
+    
+    # 返回处理结果
+    return jsonify({
+        'success': True,
+        'message': f'批量上传完成: 成功 {results["success"]} 张，失败 {results["failed"]} 张',
+        'results': results
+    }), 201
 
 
 if __name__ == '__main__':

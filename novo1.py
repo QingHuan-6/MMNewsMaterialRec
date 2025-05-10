@@ -13,8 +13,12 @@ from LLM import LLMClient
 import pymysql
 import pickle
 import base64
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from novo2 import batch_get_keywords, batch_text_embedding, preprocess_text
+from sklearn.metrics.pairwise import cosine_similarity
+
+from opencc import OpenCC
+cc = OpenCC('t2s')
 
 # 全局固定权重配置
 DEFAULT_WEIGHTS = {
@@ -249,7 +253,7 @@ class NewsAnalyzer:
                 topic=topic,
                 sentiment=sentiment,
                 embedding=embedding_pickle,
-                upload_time=datetime.now()
+                upload_time=datetime.now(timezone(timedelta(hours=8)))
             )
             
             # 添加到数据库
@@ -335,7 +339,10 @@ class NewsAnalyzer:
         }
         try:
             json_block = text.split("```json")[-1].split("```")[0].strip()
-            return {k: v for k, v in json.loads(json_block).items() if k in elements}
+            parsed_json = json.loads(json_block)
+            # 转换繁体到简体
+            converted_parsed = {cc.convert(k): v for k, v in parsed_json.items()}
+            return {k: converted_parsed.get(cc.convert(k), []) for k in elements}
         except:
             return elements
     
@@ -538,14 +545,17 @@ class ImageRecommender:
             print(f"{field}: {weight:.4f}")
         return GLOBAL_WEIGHTS.copy()
     
-    def recommend_images(self, news_elements, top_n=10, use_fixed_weights=True):
+    def recommend_images(self, news_elements,title,content, top_n=10, use_fixed_weights=True, word_threshold=0):
         """
         为新闻推荐图片
         
         参数:
             news_elements: 新闻要素字典
+            title: 新闻标题
+            content: 新闻正文
             top_n: 返回的推荐图片数量
             use_fixed_weights: 是否使用固定权重，默认为True
+            word_threshold: 正文长度阈值，决定采用哪种匹配策略
             
         返回:
             list: 包含(图片URL, 相似度)元组的列表
@@ -567,80 +577,73 @@ class ImageRecommender:
         for field, weight in best_weights.items():
             print(f"{field}: {weight:.4f}")
         
-        # 计算加权特征
-        weighted_feat = np.zeros((1, 512))
-        total_weight = sum(best_weights.values())
-        if total_weight == 0:
-            print("权重之和为零，无法计算相似度")
-            return []
-            
-        for field, weight in best_weights.items():
-            text = str(news_elements.get(field, ""))
-            if text and weight > 0:  # 确保文本不为空且权重大于0
-                try:
-                    weighted_feat += (weight / total_weight) * self.encode_text(text)
-                except Exception as e:
-                    print(f"处理特征时出错: {e}")
-                    continue
+        # 准备图片特征矩阵以便后续计算相似度
+        image_names = list(self.image_features.keys())
+        image_features = np.array([self.image_features[name] for name in image_names])
         
-        # 检查并处理空特征向量
-        if np.sum(weighted_feat) == 0:
-            print("加权特征为零向量，使用标题特征作为备选")
-            title = str(news_elements.get("标题", ""))
-            if title:
-                weighted_feat = self.encode_text(title)
-            else:
-                print("无有效文本特征")
+        # 根据内容长度决定使用的策略
+        content_length = len(content)
+        if content_length < word_threshold:
+            # 正文长度小于阈值，直接用标题+正文的文本嵌入计算相似度
+            combined_text = title + " " + content
+            print(f'正在匹配 {combined_text[:50]}...')  # 截断显示避免过长
+            text_embedding = self.encode_text(combined_text)
+            similarities = cosine_similarity(text_embedding, image_features)[0]
+        else:
+            # 分别计算每个要素的相似度得分并加权
+            weighted_scores = np.zeros(len(image_features))
+            total_weight = sum(best_weights.values())
+            
+            if total_weight == 0:
+                print("权重之和为零，无法计算相似度")
                 return []
-        
-        # 归一化向量，避免除以零
-        norm = np.linalg.norm(weighted_feat)
-        if norm > 0:
-            weighted_feat /= norm
-        
-        # 计算相似度并排序
-        similarities = []
-        for img_name, img_feat in self.image_features.items():
-            try:
-                # 修复点积计算，确保形状兼容
-                # 确保img_feat是正确的形状
-                if len(img_feat.shape) == 1:
-                    # 如果是一维数组，重塑为二维
-                    img_feat = img_feat.reshape(1, -1)
-                elif len(img_feat.shape) > 2:
-                    # 如果维度过高，展平为二维
-                    img_feat = img_feat.reshape(1, -1)
                 
-                # 执行点积
-                sim = np.dot(weighted_feat, img_feat.T)
-                
-                # 安全地获取点积结果
-                if isinstance(sim, np.ndarray):
-                    if sim.size == 1:
-                        sim_value = float(sim.item())
-                    else:
-                        sim_value = float(sim[0, 0])
-                else:
-                    sim_value = float(sim)
-                
-                if not np.isnan(sim_value) and not np.isinf(sim_value):
-                    # 使用URL而不是文件名
-                    img_url = self.image_urls.get(img_name, "")
-                    if not img_url:
-                        # 如果没有URL，使用默认路径构建
-                        img_url = f"http://localhost:5000/dataimages2/{img_name}"
+            for field, weight in best_weights.items():
+                text = ""
+                if field == "标题":
+                    text = title
+                elif field in news_elements:
+                    text = " ".join(news_elements.get(field, []))
                     
-                    similarities.append((img_url, sim_value))
-            except Exception as e:
-                print(f"计算图片 {img_name} 相似度时出错: {e}")
-                continue
-                
-        if not similarities:
-            print("未找到任何相似图片")
-            return []
+                if text and weight > 0:  # 确保文本不为空且权重大于0
+                    try:
+                        text_embedding = self.encode_text(text)
+                        field_similarities = cosine_similarity(text_embedding, image_features)[0]
+                        weighted_scores += (weight / total_weight) * field_similarities
+                    except Exception as e:
+                        print(f"处理特征 {field} 时出错: {e}")
+                        continue
             
-        similarities.sort(key=lambda x: -x[1])
-        return similarities[:top_n]
+            # 如果所有特征都处理失败，尝试使用标题
+            if np.sum(weighted_scores) == 0:
+                print("加权特征为零向量，使用标题特征作为备选")
+                if title:
+                    text_embedding = self.encode_text(title)
+                    similarities = cosine_similarity(text_embedding, image_features)[0]
+                else:
+                    print("无有效文本特征")
+                    return []
+            else:
+                similarities = weighted_scores
+        
+        # 获取排序后的索引
+        top_indices = np.argsort(-similarities)[:top_n]
+        
+        # 构建结果列表
+        recommendations = []
+        for idx in top_indices:
+            img_name = image_names[idx]
+            sim_value = float(similarities[idx])
+            
+            # 使用URL而不是文件名
+            img_url = self.image_urls.get(img_name, "")
+            if not img_url:
+                # 如果没有URL，使用默认路径构建
+                img_url = f"http://localhost:5000/dataimages2/{img_name}"
+            
+            recommendations.append((img_url, sim_value))
+        
+        return recommendations
 
     def __del__(self):
         """析构函数，确保关闭数据库连接"""
