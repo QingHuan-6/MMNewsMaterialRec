@@ -70,7 +70,7 @@ create_index()
 #通过关键词搜索图片(对应pixtock1.py,但逻辑直接写在此处了)
 @pixtock_bp.route('/api/images/search', methods=['GET'])
 def search_images():
-    """通过关键词搜索图片 (使用 CN-CLIP 和 Elasticsearch)"""
+    """通过关键词搜索图片 (使用关键词匹配和向量相似度)"""
     start_time = time.time()
     current_app.logger.info("开始搜索...")
     
@@ -93,29 +93,83 @@ def search_images():
         current_app.logger.error(f"记录检索历史时出错: {str(e)}")
     
     try:
-        # 获取 CN-CLIP 模型
-        cn_clip_model, _ = load_cn_clip_model()
-        if not cn_clip_model:
-            return jsonify({'error': 'Model not available'}), 500
+        from ..utils.es_utils import es_client
+        # 1. 首先搜索包含关键词的图片描述
+        keyword_results = []
+        try:
+            # 使用 Elasticsearch 的文本搜索功能
+            keyword_query = {
+                "query": {
+                    "bool": {
+                        "should": [
+                            {"match": {"title": query}},
+                            {"match": {"captions": query}}
+                        ],
+                        "minimum_should_match": 1
+                    }
+                },
+                "size": 100  # 获取足够多的结果
+            }
+            
+            keyword_response = es_client.search(
+                index="image_vectors",
+                body=keyword_query
+            )
+            
+            # 处理关键词匹配结果
+            for hit in keyword_response["hits"]["hits"]:
+                item = {
+                    "id": hit["_id"],
+                    "score": hit["_score"],
+                    **{k: v for k, v in hit["_source"].items() if k != "vector"}
+                }
+                item = add_thumbnail_url(item, Server_IP)
+                keyword_results.append(item)
+                
+        except Exception as e:
+            current_app.logger.error(f"关键词搜索出错: {str(e)}")
         
-        # 对查询文本进行编码
-        text_inputs = tokenize([query]).to(device)
-        with torch.no_grad():
-            text_embedding = cn_clip_model.encode_text(text_inputs).cpu().numpy()
+        # 2. 然后使用向量相似度搜索
+        vector_results = []
+        try:
+            # 获取 CN-CLIP 模型
+            cn_clip_model, _ = load_cn_clip_model()
+            if cn_clip_model:
+                # 对查询文本进行编码
+                text_inputs = tokenize([query]).to(device)
+                with torch.no_grad():
+                    text_embedding = cn_clip_model.encode_text(text_inputs).cpu().numpy()
+                
+                # 使用 Elasticsearch 搜索相似图片
+                vector_results = search_by_text_embedding(text_embedding[0])
+                
+                # 处理向量搜索结果
+                for item in vector_results:
+                    item = add_thumbnail_url(item, Server_IP)
+        except Exception as e:
+            current_app.logger.error(f"向量搜索出错: {str(e)}")
         
-        # 使用 Elasticsearch 搜索相似图片
-        search_results = search_by_text_embedding(text_embedding[0])
+        # 3. 合并结果，确保不重复
+        seen_ids = set()
+        final_results = []
         
-        # 处理搜索结果
-        for item in search_results:
-            # 添加缩略图 URL
-            item = add_thumbnail_url(item, Server_IP)
+        # 首先添加关键词匹配的结果
+        for item in keyword_results:
+            if item["id"] not in seen_ids:
+                seen_ids.add(item["id"])
+                final_results.append(item)
         
-        current_app.logger.info(f"搜索完成，找到 {len(search_results)} 个结果，耗时: {time.time() - start_time:.4f}秒")
+        # 然后添加向量相似度结果
+        for item in vector_results:
+            if item["id"] not in seen_ids:
+                seen_ids.add(item["id"])
+                final_results.append(item)
+        
+        current_app.logger.info(f"搜索完成，找到 {len(final_results)} 个结果，耗时: {time.time() - start_time:.4f}秒")
         
         return jsonify({
-            'total': len(search_results),
-            'images': search_results
+            'total': len(final_results),
+            'images': final_results
         })
         
     except Exception as e:
